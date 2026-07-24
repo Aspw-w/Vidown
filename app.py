@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import ctypes
+import math
 import os
 import queue
 import shutil
 import sys
 import threading
+import time
 import tkinter as tk
 import tkinter.font as tkfont
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,6 +39,10 @@ except ImportError:
 
 try:
     import yt_dlp
+    from yt_dlp.downloader.http import HttpFD
+    from yt_dlp.networking import Request
+    from yt_dlp.utils import parse_http_range
+    from yt_dlp.utils.networking import HTTPHeaderDict
 except ImportError:
     show_dependency_error("yt-dlp")
     raise SystemExit(1)
@@ -48,11 +55,13 @@ ctk.set_default_color_theme("blue")
 APP_NAME = "Vidown"
 APP_ID = "Vidown"
 APP_ICON_FILENAME = "icon.ico"
-DOWNLOAD_PROGRESS_MAX = 0.92
-PROGRESS_ANIMATION_INTERVAL_MS = 16
-PROGRESS_EASING = 0.24
-PROGRESS_MIN_STEP = 0.004
-PHASE_RESET_THRESHOLD = 0.25
+PARALLEL_HTTP_WORKERS = 8
+PARALLEL_HTTP_MIN_FILE_SIZE = 8 * 1024 * 1024
+PARALLEL_HTTP_CHUNK_SIZE = 4 * 1024 * 1024
+FRAGMENT_DOWNLOAD_WORKERS = 16
+DOWNLOAD_BUFFER_SIZE = 1024 * 1024
+NATIVE_HTTP_CHUNK_SIZE = 10 * 1024 * 1024
+PROGRESS_EVENT_INTERVAL_SECONDS = 0.1
 
 
 SUPPORTED_PLATFORMS = ("YouTube", "Twitter/X", "Instagram")
@@ -84,6 +93,489 @@ class FormatChoice:
     is_muxed: bool
     height: int
     sort_key: tuple[int, int, int, float, float]
+
+
+@dataclass(slots=True)
+class StreamProgress:
+    downloaded_bytes: int = 0
+    total_bytes: int | None = None
+    total_is_estimate: bool = True
+    speed: float = 0.0
+    finished: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class TransferSnapshot:
+    downloaded_bytes: int
+    total_bytes: int | None
+    total_is_estimate: bool
+    progress: float | None
+    speed: float
+    eta: float | None
+    all_finished: bool
+    should_emit: bool
+
+
+def nonnegative_int(value: object) -> int | None:
+    try:
+        result = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return result if result >= 0 else None
+
+
+def positive_float(value: object) -> float | None:
+    try:
+        result = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return result if math.isfinite(result) and result > 0 else None
+
+
+class DownloadProgressTracker:
+    """Aggregate yt-dlp progress for all selected video/audio streams."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._streams: dict[str, StreamProgress] = {}
+        self._format_keys: dict[str, list[str]] = {}
+        self._last_emit_time = 0.0
+
+    @staticmethod
+    def _initial_total(fmt: dict[str, object]) -> tuple[int | None, bool]:
+        exact = nonnegative_int(fmt.get("filesize"))
+        if exact:
+            return exact, False
+        estimate = nonnegative_int(fmt.get("filesize_approx"))
+        if estimate:
+            return estimate, True
+        return None, True
+
+    def reset(self) -> None:
+        with self._lock:
+            self._streams.clear()
+            self._format_keys.clear()
+            self._last_emit_time = 0.0
+
+    def prepare(self, info: dict[str, object]) -> TransferSnapshot:
+        requested_formats = info.get("requested_formats")
+        if isinstance(requested_formats, list) and requested_formats:
+            formats = [fmt for fmt in requested_formats if isinstance(fmt, dict)]
+        else:
+            formats = [info]
+
+        with self._lock:
+            self._streams.clear()
+            self._format_keys.clear()
+            self._last_emit_time = 0.0
+
+            for index, fmt in enumerate(formats):
+                format_id = str(fmt.get("format_id") or "").strip()
+                base_key = f"format:{format_id}" if format_id else f"stream:{index}"
+                key = base_key
+                duplicate_index = 2
+                while key in self._streams:
+                    key = f"{base_key}:{duplicate_index}"
+                    duplicate_index += 1
+
+                total, is_estimate = self._initial_total(fmt)
+                self._streams[key] = StreamProgress(
+                    total_bytes=total,
+                    total_is_estimate=is_estimate,
+                )
+                if format_id:
+                    self._format_keys.setdefault(format_id, []).append(key)
+
+            return self._snapshot_locked(should_emit=True)
+
+    def _find_stream_key_locked(
+        self,
+        data: dict[str, object],
+        info: dict[str, object],
+    ) -> str:
+        format_id = str(info.get("format_id") or "").strip()
+        matching_keys = self._format_keys.get(format_id, [])
+        if matching_keys:
+            return next(
+                (key for key in matching_keys if not self._streams[key].finished),
+                matching_keys[-1],
+            )
+
+        if len(self._streams) == 1:
+            return next(iter(self._streams))
+
+        filename = str(data.get("filename") or data.get("tmpfilename") or "").strip()
+        identity = format_id or filename or str(data.get("ctx_id") or len(self._streams))
+        key = f"observed:{identity}"
+        if key not in self._streams:
+            total, is_estimate = self._initial_total(info)
+            self._streams[key] = StreamProgress(
+                total_bytes=total,
+                total_is_estimate=is_estimate,
+            )
+            if format_id:
+                self._format_keys.setdefault(format_id, []).append(key)
+        return key
+
+    def update(self, data: dict[str, object]) -> TransferSnapshot:
+        status = str(data.get("status") or "")
+        raw_info = data.get("info_dict")
+        info = raw_info if isinstance(raw_info, dict) else {}
+        now = time.monotonic()
+
+        with self._lock:
+            key = self._find_stream_key_locked(data, info)
+            stream = self._streams[key]
+
+            downloaded = nonnegative_int(data.get("downloaded_bytes"))
+            exact_total = nonnegative_int(data.get("total_bytes"))
+            estimated_total = nonnegative_int(data.get("total_bytes_estimate"))
+
+            if downloaded is not None:
+                stream.downloaded_bytes = downloaded
+
+            if exact_total:
+                stream.total_bytes = exact_total
+                stream.total_is_estimate = False
+            elif estimated_total and (stream.total_bytes is None or stream.total_is_estimate):
+                stream.total_bytes = estimated_total
+                stream.total_is_estimate = True
+
+            if stream.total_bytes is not None and stream.downloaded_bytes > stream.total_bytes:
+                stream.total_bytes = stream.downloaded_bytes
+
+            speed = positive_float(data.get("speed"))
+            stream.speed = speed or 0.0
+
+            if status == "finished":
+                if downloaded is None:
+                    if exact_total is not None:
+                        stream.downloaded_bytes = exact_total
+                    else:
+                        filename = str(data.get("filename") or "")
+                        try:
+                            stream.downloaded_bytes = os.path.getsize(filename)
+                        except OSError:
+                            if stream.total_bytes is not None:
+                                stream.downloaded_bytes = stream.total_bytes
+
+                if stream.downloaded_bytes > 0:
+                    stream.total_bytes = stream.downloaded_bytes
+                    stream.total_is_estimate = False
+                stream.speed = 0.0
+                stream.finished = True
+
+            force_emit = status in {"finished", "error"}
+            should_emit = force_emit or now - self._last_emit_time >= PROGRESS_EVENT_INTERVAL_SECONDS
+            if should_emit:
+                self._last_emit_time = now
+            return self._snapshot_locked(should_emit=should_emit)
+
+    def _snapshot_locked(self, *, should_emit: bool) -> TransferSnapshot:
+        streams = list(self._streams.values())
+        downloaded = sum(stream.downloaded_bytes for stream in streams)
+        all_totals_known = bool(streams) and all(stream.total_bytes is not None for stream in streams)
+        total = (
+            sum(stream.total_bytes or 0 for stream in streams)
+            if all_totals_known
+            else None
+        )
+        speed = sum(stream.speed for stream in streams if not stream.finished)
+        all_finished = bool(streams) and all(stream.finished for stream in streams)
+
+        if total and total > 0:
+            progress = max(0.0, min(downloaded / total, 1.0))
+            eta = max(total - downloaded, 0) / speed if speed > 0 else None
+        elif all_finished:
+            progress = 1.0
+            eta = 0.0
+            total = downloaded or None
+        else:
+            progress = None
+            eta = None
+
+        return TransferSnapshot(
+            downloaded_bytes=downloaded,
+            total_bytes=total,
+            total_is_estimate=(
+                not all_totals_known
+                or any(stream.total_is_estimate for stream in streams)
+            ),
+            progress=progress,
+            speed=speed,
+            eta=eta,
+            all_finished=all_finished,
+            should_emit=should_emit,
+        )
+
+
+class ParallelHttpFD(HttpFD):
+    """HTTP downloader using independent byte ranges with a safe native fallback."""
+
+    def _request_extensions(self, info_dict: dict[str, object]) -> dict[str, object]:
+        extensions: dict[str, object] = {}
+        impersonate_target = self._get_impersonate_target(info_dict)
+        if impersonate_target is not None:
+            extensions["impersonate"] = impersonate_target
+        return extensions
+
+    def _probe_size(
+        self,
+        info_dict: dict[str, object],
+        headers: HTTPHeaderDict,
+    ) -> tuple[int, str | None] | None:
+        probe_headers = HTTPHeaderDict(headers)
+        probe_headers["Range"] = "bytes=0-0"
+        request = Request(
+            str(info_dict["url"]),
+            info_dict.get("request_data"),
+            probe_headers,
+            extensions=self._request_extensions(info_dict),
+        )
+        response = None
+        try:
+            response = self.ydl.urlopen(request)
+            range_start, _range_end, total = parse_http_range(
+                response.headers.get("Content-Range")
+            )
+            if range_start != 0 or not total:
+                return None
+            return int(total), response.headers.get("Last-Modified")
+        except Exception:
+            return None
+        finally:
+            if response is not None:
+                response.close()
+
+    def real_download(self, filename, info_dict):
+        if (
+            not isinstance(filename, str)
+            or filename == "-"
+            or self.params.get("test")
+            or self.params.get("nopart")
+            or info_dict.get("request_data") is not None
+        ):
+            return super().real_download(filename, info_dict)
+
+        native_tmpfilename = self.temp_name(filename)
+        if os.path.exists(native_tmpfilename):
+            # Preserve yt-dlp's reliable sequential resume behavior.
+            return super().real_download(filename, info_dict)
+        tmpfilename = f"{native_tmpfilename}.parallel"
+        self.try_remove(tmpfilename)
+
+        headers = HTTPHeaderDict(
+            {"Accept-Encoding": "identity"},
+            info_dict.get("http_headers"),
+        )
+        if headers.get("Range"):
+            return super().real_download(filename, info_dict)
+
+        probe = self._probe_size(info_dict, headers)
+        if probe is None:
+            return super().real_download(filename, info_dict)
+        total_bytes, last_modified = probe
+        if total_bytes < PARALLEL_HTTP_MIN_FILE_SIZE:
+            return super().real_download(filename, info_dict)
+
+        min_filesize = nonnegative_int(self.params.get("min_filesize"))
+        max_filesize = nonnegative_int(self.params.get("max_filesize"))
+        if (
+            (min_filesize is not None and total_bytes < min_filesize)
+            or (max_filesize is not None and total_bytes > max_filesize)
+        ):
+            return super().real_download(filename, info_dict)
+
+        configured_workers = nonnegative_int(
+            self.params.get("parallel_http_workers")
+        ) or PARALLEL_HTTP_WORKERS
+        worker_count = max(1, min(configured_workers, 32))
+        target_range_size = max(
+            PARALLEL_HTTP_CHUNK_SIZE,
+            math.ceil(total_bytes / (worker_count * 4)),
+        )
+        ranges = [
+            (start, min(start + target_range_size - 1, total_bytes - 1))
+            for start in range(0, total_bytes, target_range_size)
+        ]
+        if len(ranges) < 2:
+            return super().real_download(filename, info_dict)
+        worker_count = min(worker_count, len(ranges))
+
+        try:
+            stream, tmpfilename = self.sanitize_open(tmpfilename, "w+b")
+            try:
+                stream.truncate(total_bytes)
+            finally:
+                stream.close()
+            self.report_destination(filename)
+        except OSError:
+            self.try_remove(tmpfilename)
+            return super().real_download(filename, info_dict)
+
+        progress_lock = threading.Lock()
+        stop_event = threading.Event()
+        started_at = time.monotonic()
+        downloaded_bytes = 0
+        last_progress_at = 0.0
+        buffer_size = nonnegative_int(self.params.get("buffersize")) or DOWNLOAD_BUFFER_SIZE
+        retry_count = nonnegative_int(self.params.get("retries"))
+        if retry_count is None:
+            retry_count = 10
+
+        def emit_progress(delta: int, *, force: bool = False) -> None:
+            nonlocal downloaded_bytes, last_progress_at
+            with progress_lock:
+                downloaded_bytes += delta
+                now = time.monotonic()
+                if not force and now - last_progress_at < PROGRESS_EVENT_INTERVAL_SECONDS:
+                    return
+                last_progress_at = now
+                current_downloaded = downloaded_bytes
+
+            elapsed = max(now - started_at, 0.001)
+            speed = current_downloaded / elapsed
+            self._hook_progress(
+                {
+                    "status": "downloading",
+                    "downloaded_bytes": current_downloaded,
+                    "total_bytes": total_bytes,
+                    "tmpfilename": tmpfilename,
+                    "filename": filename,
+                    "eta": max(total_bytes - current_downloaded, 0) / speed,
+                    "speed": speed,
+                    "elapsed": elapsed,
+                    "ctx_id": info_dict.get("ctx_id"),
+                },
+                info_dict,
+            )
+
+        def download_range(range_start: int, range_end: int) -> None:
+            position = range_start
+            attempts = 0
+
+            with open(tmpfilename, "r+b", buffering=0) as output:
+                while position <= range_end and not stop_event.is_set():
+                    range_headers = HTTPHeaderDict(headers)
+                    range_headers["Range"] = f"bytes={position}-{range_end}"
+                    request = Request(
+                        str(info_dict["url"]),
+                        info_dict.get("request_data"),
+                        range_headers,
+                        extensions=self._request_extensions(info_dict),
+                    )
+                    response = None
+                    try:
+                        response = self.ydl.urlopen(request)
+                        response_start, response_end, response_total = parse_http_range(
+                            response.headers.get("Content-Range")
+                        )
+                        if (
+                            response_start != position
+                            or response_end is None
+                            or response_end > range_end
+                            or response_total != total_bytes
+                        ):
+                            raise OSError("サーバーが要求したバイト範囲を返しませんでした")
+
+                        output.seek(position)
+                        remaining = response_end - position + 1
+                        while remaining > 0 and not stop_event.is_set():
+                            block = response.read(min(buffer_size, remaining))
+                            if not block:
+                                raise OSError("バイト範囲の受信が途中で終了しました")
+                            output.write(block)
+                            position += len(block)
+                            remaining -= len(block)
+                            emit_progress(len(block))
+                        attempts = 0
+                    except Exception:
+                        attempts += 1
+                        if attempts > retry_count or stop_event.is_set():
+                            raise
+                        time.sleep(min(0.25 * (2 ** (attempts - 1)), 2.0))
+                    finally:
+                        if response is not None:
+                            response.close()
+
+        failures: list[Exception] = []
+        try:
+            with ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="vidown-http",
+            ) as executor:
+                futures = [
+                    executor.submit(download_range, range_start, range_end)
+                    for range_start, range_end in ranges
+                ]
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        failures.append(exc)
+                        stop_event.set()
+                        for pending in futures:
+                            pending.cancel()
+                        break
+        except Exception as exc:
+            failures.append(exc)
+            stop_event.set()
+
+        if failures:
+            self.try_remove(tmpfilename)
+            self.report_warning(
+                "並列HTTPダウンロードを継続できないため、標準方式で再試行します。"
+            )
+            return super().real_download(filename, info_dict)
+
+        emit_progress(0, force=True)
+        self.try_rename(tmpfilename, filename)
+        if self.params.get("updatetime"):
+            info_dict["filetime"] = self.try_utime(filename, last_modified)
+
+        elapsed = max(time.monotonic() - started_at, 0.0)
+        self._hook_progress(
+            {
+                "status": "finished",
+                "downloaded_bytes": total_bytes,
+                "total_bytes": total_bytes,
+                "filename": filename,
+                "elapsed": elapsed,
+                "ctx_id": info_dict.get("ctx_id"),
+            },
+            info_dict,
+        )
+        return True
+
+
+class FastYoutubeDL(yt_dlp.YoutubeDL):
+    def dl(self, name, info, subtitle=False, test=False):
+        protocol = str(info.get("protocol") or "")
+        url = str(info.get("url") or "")
+        can_use_parallel_http = (
+            not subtitle
+            and not test
+            and isinstance(name, str)
+            and name != "-"
+            and protocol in {"http", "https"}
+            and urlparse(url).scheme in {"http", "https"}
+            and not info.get("fragments")
+            and not info.get("requested_formats")
+            and not info.get("section_start")
+            and not info.get("section_end")
+        )
+        if not can_use_parallel_http:
+            return super().dl(name, info, subtitle=subtitle, test=test)
+
+        downloader = ParallelHttpFD(self, self.params)
+        for progress_hook in self._progress_hooks:
+            downloader.add_progress_hook(progress_hook)
+
+        new_info = self._copy_infodict(info)
+        if new_info.get("http_headers") is None:
+            new_info["http_headers"] = self._calc_headers(new_info)
+        self.write_debug(f"Invoking {downloader.FD_NAME} downloader on a direct HTTP stream")
+        return downloader.download(name, new_info, subtitle)
 
 
 class GUID(ctypes.Structure):
@@ -562,12 +1054,9 @@ class VideoDownloaderApp(ctk.CTk):
         self.event_queue: queue.Queue[dict[str, object]] = queue.Queue()
         self.is_busy = False
         self.format_dialog: FormatSelectionDialog | None = None
+        self.progress_tracker = DownloadProgressTracker()
         self.progress_value = 0.0
-        self.progress_target = 0.0
-        self.progress_animation_job: str | None = None
-        self.progress_phase_count = 1
-        self.progress_phase_index = 0
-        self.progress_last_raw_value = 0.0
+        self.progress_is_indeterminate = False
 
         self.url_var.trace_add("write", self.on_url_changed)
 
@@ -857,80 +1346,28 @@ class VideoDownloaderApp(ctk.CTk):
             pass
 
     def reset_progress_tracking(self) -> None:
-        self.progress_phase_count = 1
-        self.progress_phase_index = 0
-        self.progress_last_raw_value = 0.0
+        self.progress_tracker.reset()
         self.set_progress(0.0, immediate=True)
 
-    def start_progress_tracking(self, choice: FormatChoice) -> None:
-        self.progress_phase_count = 2 if choice.requires_merge else 1
-        self.progress_phase_index = 0
-        self.progress_last_raw_value = 0.0
+    def start_progress_tracking(self, _choice: FormatChoice) -> None:
+        self.progress_tracker.reset()
         self.set_progress(0.0, immediate=True)
-
-    def map_download_progress(self, raw_progress: float) -> float:
-        clamped = max(0.0, min(raw_progress, 1.0))
-        completed_fraction = self.progress_phase_index + clamped
-        return min(
-            (completed_fraction / max(self.progress_phase_count, 1)) * DOWNLOAD_PROGRESS_MAX,
-            DOWNLOAD_PROGRESS_MAX,
-        )
-
-    def update_download_progress(self, raw_progress: float) -> float:
-        clamped = max(0.0, min(raw_progress, 1.0))
-        if (
-            self.progress_phase_count > 1
-            and self.progress_phase_index < self.progress_phase_count - 1
-            and self.progress_last_raw_value >= 0.85
-            and clamped + PHASE_RESET_THRESHOLD < self.progress_last_raw_value
-        ):
-            self.progress_phase_index += 1
-            self.progress_last_raw_value = 0.0
-
-        self.progress_last_raw_value = max(self.progress_last_raw_value, clamped)
-        return self.map_download_progress(self.progress_last_raw_value)
-
-    def finish_current_progress_phase(self) -> float:
-        self.progress_last_raw_value = 1.0
-        return self.map_download_progress(1.0)
 
     def set_progress(self, value: float, *, immediate: bool = False) -> None:
         clamped = max(0.0, min(value, 1.0))
-        self.progress_target = clamped
+        if self.progress_is_indeterminate:
+            self.progress_bar.stop()
+            self.progress_bar.configure(mode="determinate")
+            self.progress_is_indeterminate = False
+        self.progress_value = clamped
+        self.progress_bar.set(clamped)
 
-        if immediate:
-            if self.progress_animation_job is not None:
-                self.after_cancel(self.progress_animation_job)
-                self.progress_animation_job = None
-            self.progress_value = clamped
-            self.progress_bar.set(clamped)
+    def set_indeterminate_progress(self) -> None:
+        if self.progress_is_indeterminate:
             return
-
-        if self.progress_animation_job is None:
-            self.progress_animation_job = self.after(
-                PROGRESS_ANIMATION_INTERVAL_MS,
-                self.animate_progress,
-            )
-
-    def animate_progress(self) -> None:
-        diff = self.progress_target - self.progress_value
-        if abs(diff) <= PROGRESS_MIN_STEP:
-            self.progress_value = self.progress_target
-            self.progress_bar.set(self.progress_value)
-            self.progress_animation_job = None
-            return
-
-        step = max(abs(diff) * PROGRESS_EASING, PROGRESS_MIN_STEP)
-        if diff > 0:
-            self.progress_value = min(self.progress_value + step, self.progress_target)
-        else:
-            self.progress_value = max(self.progress_value - step, self.progress_target)
-
-        self.progress_bar.set(self.progress_value)
-        self.progress_animation_job = self.after(
-            PROGRESS_ANIMATION_INTERVAL_MS,
-            self.animate_progress,
-        )
+        self.progress_bar.configure(mode="indeterminate")
+        self.progress_bar.start()
+        self.progress_is_indeterminate = True
 
     def make_ydl_options(
         self,
@@ -946,11 +1383,19 @@ class VideoDownloaderApp(ctk.CTk):
             "noplaylist": True,
             "windowsfilenames": True,
             "logger": YtdlpLogger(self.emit_event),
-            "retries": 3,
-            "fragment_retries": 3,
-            "extractor_retries": 3,
-            "concurrent_fragment_downloads": 4,
+            "retries": 10,
+            "fragment_retries": 10,
+            "extractor_retries": 5,
+            "file_access_retries": 3,
+            "socket_timeout": 30,
+            "buffersize": DOWNLOAD_BUFFER_SIZE,
+            "noresizebuffer": True,
+            "http_chunk_size": NATIVE_HTTP_CHUNK_SIZE,
+            "concurrent_fragment_downloads": FRAGMENT_DOWNLOAD_WORKERS,
+            "parallel_http_workers": PARALLEL_HTTP_WORKERS,
+            "hls_prefer_native": True,
             "quiet": True,
+            "noprogress": True,
             "no_warnings": False,
         }
 
@@ -1226,8 +1671,26 @@ class VideoDownloaderApp(ctk.CTk):
         )
 
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
+            with FastYoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                if not isinstance(info, dict):
+                    raise RuntimeError("ダウンロード情報を取得できませんでした。")
+
+                initial_progress = self.progress_tracker.prepare(info)
+                total_label = (
+                    f"{'約 ' if initial_progress.total_is_estimate else ''}"
+                    f"{human_readable_size(initial_progress.total_bytes)}"
+                    if initial_progress.total_bytes is not None
+                    else "確認中"
+                )
+                self.emit_event(
+                    {
+                        "type": "progress",
+                        "progress": initial_progress.progress,
+                        "message": f"ダウンロードを開始します... 合計 {total_label}",
+                    }
+                )
+                ydl.process_info(info)
 
             self.emit_event(
                 {
@@ -1247,36 +1710,50 @@ class VideoDownloaderApp(ctk.CTk):
 
     def on_progress(self, data: dict[str, object]) -> None:
         status = data.get("status")
-        if status == "downloading":
-            downloaded = data.get("downloaded_bytes") or 0
-            total = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
-            raw_progress = min(float(downloaded) / float(total), 1.0) if total else 0.0
-            progress = self.update_download_progress(raw_progress)
-            speed = human_readable_size(data.get("speed"))
-            eta = format_eta(data.get("eta"))
-            status_text = (
-                f"ダウンロード中... {progress * 100:5.1f}%  "
-                f"{human_readable_size(downloaded)} / {human_readable_size(total)}  "
-                f"{speed}/s  ETA {eta}"
-            )
+        if status in {"downloading", "finished", "error"}:
+            snapshot = self.progress_tracker.update(data)
+            if not snapshot.should_emit:
+                return
+
+            if snapshot.total_bytes is None:
+                amount_text = (
+                    f"{human_readable_size(snapshot.downloaded_bytes)} / 合計サイズ確認中"
+                )
+                percent_text = "計測中"
+            else:
+                approximate = "約 " if snapshot.total_is_estimate else ""
+                amount_text = (
+                    f"{human_readable_size(snapshot.downloaded_bytes)} / "
+                    f"{approximate}{human_readable_size(snapshot.total_bytes)}"
+                )
+                percent_value = (snapshot.progress or 0.0) * 100
+                percent_text = f"{approximate}{percent_value:5.1f}%"
+
+            if snapshot.all_finished:
+                status_text = f"ダウンロード完了。{amount_text}  後処理を実行しています..."
+            elif status == "error":
+                status_text = f"ダウンロードを再試行しています... {amount_text}"
+            else:
+                speed_text = (
+                    f"{human_readable_size(snapshot.speed)}/s"
+                    if snapshot.speed > 0
+                    else "-- B/s"
+                )
+                status_text = (
+                    f"ダウンロード中... {percent_text}  {amount_text}  "
+                    f"{speed_text}  ETA {format_eta(snapshot.eta)}"
+                )
+
             self.emit_event(
                 {
                     "type": "progress",
-                    "progress": progress,
+                    "progress": snapshot.progress,
                     "message": status_text,
                 }
             )
-        elif status == "finished":
+
+        if status == "finished":
             filename = str(data.get("filename") or "")
-            completed_progress = self.finish_current_progress_phase()
-            if self.progress_phase_index >= self.progress_phase_count - 1:
-                self.emit_event(
-                    {
-                        "type": "progress",
-                        "progress": max(completed_progress, DOWNLOAD_PROGRESS_MAX),
-                        "message": "ダウンロード完了。後処理を実行しています...",
-                    }
-                )
             if filename:
                 self.emit_event({"type": "log", "message": f"保存ファイル: {filename}"})
 
@@ -1296,7 +1773,11 @@ class VideoDownloaderApp(ctk.CTk):
             elif event_type == "status":
                 self.status_var.set(str(event.get("message", "")))
             elif event_type == "progress":
-                self.set_progress(float(event.get("progress", 0.0)))
+                progress = event.get("progress")
+                if isinstance(progress, (int, float)):
+                    self.set_progress(float(progress))
+                else:
+                    self.set_indeterminate_progress()
                 self.status_var.set(str(event.get("message", "")))
             elif event_type == "formats_loaded":
                 choices = event.get("choices")
