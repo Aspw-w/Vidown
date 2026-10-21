@@ -22,11 +22,9 @@ const SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub enum Outcome {
     Completed,
-    /// The stream must be downloaded by yt-dlp's own downloader instead.
     Fallback,
 }
 
-/// Mirrors the `FastYoutubeDL.dl` checks: only plain, single-file HTTP(S) streams qualify.
 pub fn can_use_parallel_http(info: &Value) -> bool {
     let protocol = json_str(info.get("protocol"));
     let url = json_str(info.get("url"));
@@ -41,7 +39,6 @@ pub fn can_use_parallel_http(info: &Value) -> bool {
         && !json_truthy(info.get("section_end"))
 }
 
-/// Parses `bytes START-END/TOTAL`, like yt-dlp's `parse_http_range`.
 fn parse_http_range(header: Option<&str>) -> (Option<u64>, Option<u64>, Option<u64>) {
     let Some(header) = header else {
         return (None, None, None);
@@ -242,7 +239,6 @@ fn finished(filename: &Path, total_bytes: u64, info: &Value) -> ProgressData {
     }
 }
 
-/// HTTP downloader using independent byte ranges; returns `Fallback` whenever yt-dlp should take over.
 pub fn download(
     info: &Value,
     cookie_file_path: Option<&Path>,
@@ -263,7 +259,6 @@ pub fn download(
 
     let native_tmpfilename = path_with_suffix(&filename, ".part");
     if native_tmpfilename.exists() {
-        // Preserve yt-dlp's reliable sequential resume behavior.
         return Outcome::Fallback;
     }
     let tmpfilename = path_with_suffix(&native_tmpfilename, ".parallel");

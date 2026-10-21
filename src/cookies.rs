@@ -1,7 +1,6 @@
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// A cookie from a Netscape-format cookies.txt file.
 struct Cookie {
     domain: String,
     include_subdomains: bool,
@@ -46,7 +45,6 @@ impl CookieJar {
         Ok(Self { cookies })
     }
 
-    /// Builds the `Cookie` header value to send to `url`, if any cookie matches.
     pub fn header_for(&self, url: &str) -> Option<String> {
         let (scheme, rest) = url.split_once("://")?;
         let is_https = scheme.eq_ignore_ascii_case("https");

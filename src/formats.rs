@@ -28,7 +28,6 @@ impl FormatChoice {
     }
 }
 
-/// `value in {None, "none"}` for a codec field.
 fn is_none_codec(value: Option<&Value>) -> bool {
     matches!(value, None | Some(Value::Null)) || value.and_then(Value::as_str) == Some("none")
 }
@@ -65,7 +64,6 @@ fn looks_like_muxed_format(fmt: &Value, platform: &str) -> bool {
     is_social_platform(platform) && (protocol == "https" || format_id.starts_with("http-"))
 }
 
-/// Returns `(selector, is_muxed)`; non-muxed selectors require an ffmpeg merge.
 fn build_selector_for_format(fmt: &Value, platform: &str, ffmpeg_available: bool) -> Option<(String, bool)> {
     let format_id = json_str(fmt.get("format_id")).trim().to_string();
     if format_id.is_empty() || !is_video_format(fmt) {
@@ -181,7 +179,6 @@ pub fn build_format_choices(info: &Value, platform: &str, ffmpeg_available: bool
         choices.push(choice);
     }
 
-    // Stable sort, descending, like Python's `sort(reverse=True)`.
     choices.sort_by(|a, b| b.cmp_sort_key(a));
     choices
 }

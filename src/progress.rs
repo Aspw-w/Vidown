@@ -8,7 +8,6 @@ use crate::util::{json_str, nonnegative_int};
 
 pub const PROGRESS_EVENT_INTERVAL: Duration = Duration::from_millis(100);
 
-/// One yt-dlp progress hook call, with the fields of `info_dict` the tracker needs.
 #[derive(Clone, Debug, Default)]
 pub struct ProgressData {
     pub status: String,
@@ -23,7 +22,6 @@ pub struct ProgressData {
 }
 
 impl ProgressData {
-    /// Parses the `--progress-template` JSON pair emitted by yt-dlp.
     pub fn from_json(info: Value, progress: &Value) -> Self {
         let speed = progress.get("speed");
         Self {
@@ -183,7 +181,6 @@ fn initial_total(fmt: &Value) -> (Option<u64>, bool) {
     (None, true)
 }
 
-/// Aggregates yt-dlp progress for all selected video/audio streams.
 #[derive(Default)]
 pub struct DownloadProgressTracker {
     state: Mutex<TrackerState>,

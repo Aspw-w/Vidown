@@ -24,7 +24,6 @@ pub struct YdlOptions {
     pub js_runtime_name: Option<&'static str>,
 }
 
-/// Command-line equivalent of the yt-dlp option dict the original app passed to `YoutubeDL`.
 pub fn make_ydl_options(
     platform: &str,
     browser_name: Option<&str>,
@@ -142,7 +141,6 @@ impl YtDlp {
         command.spawn().map_err(|err| format!("yt-dlp を起動できませんでした: {err}"))
     }
 
-    /// Runs yt-dlp to completion while forwarding stdout lines, returning an error built from stderr on failure.
     fn run(&self, args: &[OsString], log: &(impl Fn(String) + Sync), mut on_stdout_line: impl FnMut(&str)) -> Result<(), String> {
         let mut child = self.spawn(args)?;
         let stdout = child.stdout.take().expect("stdout is piped");
@@ -206,21 +204,18 @@ impl YtDlp {
         serde_json::from_str(&line).map_err(|err| format!("yt-dlp の出力を解析できませんでした: {err}"))
     }
 
-    /// `extract_info(url, download=False)` with yt-dlp's default format selection.
     pub fn extract_info(&self, options: &YdlOptions, url: &str, log: &(impl Fn(String) + Sync)) -> Result<Value, String> {
         let mut args = options.args.clone();
         args.extend(["--dump-single-json".into(), "--".into(), url.into()]);
         self.run_json(args, log)
     }
 
-    /// Like `extract_info`, but also resolves the selected format(s) and the output `filename`.
     pub fn resolve_download(&self, options: &YdlOptions, url: &str, log: &(impl Fn(String) + Sync)) -> Result<Value, String> {
         let mut args = options.args.clone();
         args.extend(["--print".into(), "%()j".into(), "--".into(), url.into()]);
         self.run_json(args, log)
     }
 
-    /// `process_info(info)`: downloads and post-processes a previously resolved info dict.
     pub fn download_info(
         &self,
         options: &YdlOptions,

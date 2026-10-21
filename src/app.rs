@@ -46,7 +46,6 @@ fn button_font() -> FontId {
     FontId::new(14.0, FontFamily::Name(BOLD_FAMILY.into()))
 }
 
-/// customtkinter "blue" theme colors, chosen per light/dark mode.
 struct Palette {
     window: Color32,
     frame: Color32,
@@ -111,7 +110,6 @@ fn text_entry<'a>(palette: &Palette, text: &'a mut String, hint: &str, height: f
         .desired_width(width)
 }
 
-/// A full-width row laid out right to left, so the last widget added can fill the remaining space.
 fn row(ui: &mut Ui, height: f32, add_contents: impl FnOnce(&mut Ui)) {
     ui.allocate_ui_with_layout(
         Vec2::new(ui.available_width(), height),
@@ -151,7 +149,6 @@ pub struct VidownApp {
     is_busy: bool,
     format_dialog: Option<FormatDialog>,
     tracker: Arc<DownloadProgressTracker>,
-    /// `None` while the progress bar is in indeterminate mode.
     progress: Option<f32>,
     events: Receiver<Event>,
     emitter: Emitter,

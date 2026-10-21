@@ -11,7 +11,6 @@ pub fn supported_sites_text() -> String {
     SUPPORTED_PLATFORMS.join(" / ")
 }
 
-/// `int(value)` that rejects negatives, mirroring Python's tolerant parsing of yt-dlp fields.
 pub fn nonnegative_int(value: Option<&Value>) -> Option<u64> {
     match value? {
         Value::Number(number) => {
@@ -39,7 +38,6 @@ pub fn positive_float(value: Option<&Value>) -> Option<f64> {
     (result.is_finite() && result > 0.0).then_some(result)
 }
 
-/// Python `str(value or "")` for a JSON field.
 pub fn json_str(value: Option<&Value>) -> String {
     match value {
         None | Some(Value::Null) => String::new(),
@@ -50,7 +48,6 @@ pub fn json_str(value: Option<&Value>) -> String {
     }
 }
 
-/// Python truthiness for a JSON field.
 pub fn json_truthy(value: Option<&Value>) -> bool {
     match value {
         None | Some(Value::Null) => false,
@@ -159,7 +156,6 @@ pub fn ffmpeg_available() -> bool {
     which::which("ffmpeg").is_ok()
 }
 
-/// yt-dlp is looked up next to the executable first so it can be shipped alongside Vidown.exe.
 pub fn find_ytdlp() -> Option<PathBuf> {
     if let Some(exe_dir) = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf)) {
         for name in ["yt-dlp.exe", "yt-dlp"] {
@@ -194,22 +190,18 @@ fn get_windows_downloads_folder() -> Option<PathBuf> {
     use windows_sys::Win32::UI::Shell::{FOLDERID_Downloads, SHGetKnownFolderPath};
 
     let mut path_ptr: *mut u16 = std::ptr::null_mut();
-    // SAFETY: FOLDERID_Downloads is a valid GUID and path_ptr receives a CoTaskMem-allocated string.
     let result = unsafe { SHGetKnownFolderPath(&FOLDERID_Downloads, 0, std::ptr::null_mut(), &mut path_ptr) };
     if result != 0 || path_ptr.is_null() {
         if !path_ptr.is_null() {
-            // SAFETY: the pointer was allocated by SHGetKnownFolderPath.
             unsafe { CoTaskMemFree(path_ptr.cast()) };
         }
         return None;
     }
 
-    // SAFETY: path_ptr is a valid NUL-terminated wide string until freed below.
     let path = unsafe {
         let len = (0..).take_while(|&i| *path_ptr.add(i) != 0).count();
         std::ffi::OsString::from_wide(std::slice::from_raw_parts(path_ptr, len))
     };
-    // SAFETY: the pointer was allocated by SHGetKnownFolderPath.
     unsafe { CoTaskMemFree(path_ptr.cast()) };
     Some(PathBuf::from(path)).filter(|path| !path.as_os_str().is_empty())
 }
@@ -227,7 +219,6 @@ pub fn set_windows_app_id(app_id: &str) {
     {
         use windows_sys::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
         let wide: Vec<u16> = app_id.encode_utf16().chain(std::iter::once(0)).collect();
-        // SAFETY: wide is a NUL-terminated UTF-16 string that outlives the call.
         unsafe { SetCurrentProcessExplicitAppUserModelID(wide.as_ptr()) };
     }
     #[cfg(not(windows))]

@@ -19,7 +19,6 @@ use crate::util::{APP_ID, APP_NAME, find_ytdlp, set_windows_app_id};
 
 const APP_ICON: &[u8] = include_bytes!("../icon.ico");
 
-/// `(file, face index)` candidates in the Windows font folder, in order of preference.
 const BODY_FONTS: [(&str, u32); 3] = [("YuGothM.ttc", 1), ("segoeui.ttf", 0), ("meiryo.ttc", 2)];
 const BOLD_FONTS: [(&str, u32); 3] = [("YuGothB.ttc", 1), ("segoeuib.ttf", 0), ("meiryob.ttc", 2)];
 const TITLE_FONTS: [(&str, u32); 2] = [("segoeuib.ttf", 0), ("YuGothB.ttc", 1)];

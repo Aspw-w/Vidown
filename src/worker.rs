@@ -33,7 +33,6 @@ pub struct FormatsLoaded {
     pub choices: Vec<FormatChoice>,
 }
 
-/// Sends events from worker threads to the UI thread and wakes it up.
 #[derive(Clone)]
 pub struct Emitter {
     tx: Sender<Event>,
