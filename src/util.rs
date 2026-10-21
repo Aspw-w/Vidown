@@ -184,13 +184,13 @@ fn home_dir() -> Option<PathBuf> {
 }
 
 #[cfg(windows)]
-fn get_windows_downloads_folder() -> Option<PathBuf> {
+fn get_windows_known_folder(folder_id: &windows_sys::core::GUID) -> Option<PathBuf> {
     use std::os::windows::ffi::OsStringExt;
     use windows_sys::Win32::System::Com::CoTaskMemFree;
-    use windows_sys::Win32::UI::Shell::{FOLDERID_Downloads, SHGetKnownFolderPath};
+    use windows_sys::Win32::UI::Shell::SHGetKnownFolderPath;
 
     let mut path_ptr: *mut u16 = std::ptr::null_mut();
-    let result = unsafe { SHGetKnownFolderPath(&FOLDERID_Downloads, 0, std::ptr::null_mut(), &mut path_ptr) };
+    let result = unsafe { SHGetKnownFolderPath(folder_id, 0, std::ptr::null_mut(), &mut path_ptr) };
     if result != 0 || path_ptr.is_null() {
         if !path_ptr.is_null() {
             unsafe { CoTaskMemFree(path_ptr.cast()) };
@@ -208,10 +208,20 @@ fn get_windows_downloads_folder() -> Option<PathBuf> {
 
 pub fn get_downloads_directory() -> PathBuf {
     #[cfg(windows)]
-    if let Some(downloads_dir) = get_windows_downloads_folder() {
+    if let Some(downloads_dir) = get_windows_known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_Downloads) {
         return downloads_dir;
     }
     home_dir().unwrap_or_default().join("Downloads")
+}
+
+pub fn get_roaming_app_data_directory() -> PathBuf {
+    #[cfg(windows)]
+    if let Some(app_data_dir) = get_windows_known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_RoamingAppData) {
+        return app_data_dir;
+    }
+    std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().unwrap_or_default().join("AppData").join("Roaming"))
 }
 
 pub fn set_windows_app_id(app_id: &str) {

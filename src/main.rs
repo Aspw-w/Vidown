@@ -5,6 +5,7 @@ mod cookies;
 mod formats;
 mod parallel_http;
 mod progress;
+mod settings;
 mod util;
 mod worker;
 mod ytdlp;

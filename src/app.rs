@@ -10,6 +10,7 @@ use rfd::{FileDialog, MessageButtons, MessageDialog, MessageLevel};
 
 use crate::formats::{FormatChoice, describe_selected_format};
 use crate::progress::DownloadProgressTracker;
+use crate::settings::Settings;
 use crate::util::{APP_NAME, detect_platform, expand_user, get_downloads_directory, supported_sites_text};
 use crate::worker::{self, DownloadRequest, Emitter, Event, FormatsLoaded};
 use crate::ytdlp::YtDlp;
@@ -143,6 +144,7 @@ pub struct VidownApp {
     ytdlp: Arc<YtDlp>,
     url: String,
     folder: String,
+    saved_folder: String,
     browser_index: usize,
     cookie_file: String,
     status: String,
@@ -157,10 +159,14 @@ pub struct VidownApp {
 impl VidownApp {
     pub fn new(cc: &eframe::CreationContext<'_>, ytdlp: YtDlp) -> Self {
         let (tx, events) = channel();
+        let folder = Settings::load()
+            .output_dir
+            .unwrap_or_else(|| get_downloads_directory().to_string_lossy().into_owned());
         Self {
             ytdlp: Arc::new(ytdlp),
             url: String::new(),
-            folder: get_downloads_directory().to_string_lossy().into_owned(),
+            saved_folder: folder.clone(),
+            folder,
             browser_index: 0,
             cookie_file: String::new(),
             status: "URLを入力してダウンロードを開始してください。".to_string(),
@@ -170,6 +176,12 @@ impl VidownApp {
             progress: Some(0.0),
             events,
             emitter: Emitter::new(tx, cc.egui_ctx.clone()),
+        }
+    }
+
+    fn save_folder_if_changed(&mut self) {
+        if self.folder != self.saved_folder && Settings::save_output_dir(&self.folder).is_ok() {
+            self.saved_folder = self.folder.clone();
         }
     }
 
@@ -595,6 +607,7 @@ impl VidownApp {
 impl eframe::App for VidownApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.process_events();
+        self.save_folder_if_changed();
 
         let ctx = ui.ctx().clone();
         let palette = Palette::for_mode(ui.visuals().dark_mode);

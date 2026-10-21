@@ -16,6 +16,10 @@ cargo build --release
 
 `target/release/Vidown.exe` が生成されます（アイコン埋め込み済み）。
 
+## 設定の保存
+
+保存先フォルダの設定は `%APPDATA%\Vidown\settings.json` に保存され、次回起動時に読み込まれます。
+
 ## 構成
 
 | ファイル | 内容 |
@@ -26,3 +30,4 @@ cargo build --release
 | `src/parallel_http.rs` | 単一ファイル HTTP ストリームの並列レンジダウンロード |
 | `src/progress.rs` | 映像・音声ストリームの進捗集計 |
 | `src/formats.rs` | 画質一覧の組み立てと並べ替え |
+| `src/settings.rs` | 保存先フォルダ設定の読み書き |
