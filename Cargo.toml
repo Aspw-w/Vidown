@@ -1,0 +1,36 @@
+[package]
+name = "vidown"
+version = "0.1.0"
+edition = "2024"
+description = "YouTube / Twitter(X) / Instagram video downloader"
+
+[[bin]]
+name = "Vidown"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.37"
+rfd = "0.17"
+reqwest = { version = "0.13", features = ["blocking"] }
+serde_json = "1"
+which = "8"
+open = "5"
+image = { version = "0.25", default-features = false, features = ["ico", "png"] }
+filetime = "0.2"
+httpdate = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+] }
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
