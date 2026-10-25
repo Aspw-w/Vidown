@@ -6,7 +6,7 @@ use std::process::{Child, Command, Stdio};
 use serde_json::Value;
 
 use crate::progress::ProgressData;
-use crate::util::{detect_js_runtime, ffmpeg_available};
+use crate::util::{detect_js_runtime, find_ffmpeg};
 
 pub const FRAGMENT_DOWNLOAD_WORKERS: u32 = 16;
 pub const DOWNLOAD_BUFFER_SIZE: usize = 1024 * 1024;
@@ -17,11 +17,14 @@ const PROGRESS_TEMPLATE: &str =
     "download:VIDOWN_PROGRESS %(info.{format_id,filesize,filesize_approx})j\t%(progress)j";
 const OUTPUT_TEMPLATE: &str = "%(title).200B [%(id)s].%(ext)s";
 const CHROME_COOKIE_COPY_ERROR: &str = "Could not copy Chrome cookie database";
+const PAGE_RELOAD_ERROR: &str = "The page needs to be reloaded";
+const PAGE_RELOAD_FALLBACK_EXTRACTOR_ARGS: &str = "youtube:player_client=default,web_embedded,-tv_downgraded";
 
 pub struct YdlOptions {
     args: Vec<OsString>,
     pub ffmpeg_available: bool,
     pub js_runtime_name: Option<&'static str>,
+    is_youtube: bool,
 }
 
 pub fn make_ydl_options(
@@ -32,7 +35,8 @@ pub fn make_ydl_options(
     format_selector: Option<&str>,
     log: impl Fn(String),
 ) -> YdlOptions {
-    let ffmpeg_available = ffmpeg_available();
+    let ffmpeg_path = find_ffmpeg();
+    let ffmpeg_available = ffmpeg_path.is_some();
     let mut args: Vec<OsString> = [
         "--ignore-config",
         "--no-playlist",
@@ -67,7 +71,9 @@ pub fn make_ydl_options(
         args.push(output_dir.join(OUTPUT_TEMPLATE).into_os_string());
     }
 
-    if ffmpeg_available {
+    if let Some(ffmpeg_path) = ffmpeg_path {
+        args.push("--ffmpeg-location".into());
+        args.push(ffmpeg_path.into_os_string());
         args.push("--merge-output-format".into());
         args.push("mp4/mkv".into());
     }
@@ -104,6 +110,7 @@ pub fn make_ydl_options(
         args,
         ffmpeg_available,
         js_runtime_name,
+        is_youtube: platform == "YouTube",
     }
 }
 
@@ -204,16 +211,32 @@ impl YtDlp {
         serde_json::from_str(&line).map_err(|err| format!("yt-dlp の出力を解析できませんでした: {err}"))
     }
 
-    pub fn extract_info(&self, options: &YdlOptions, url: &str, log: &(impl Fn(String) + Sync)) -> Result<Value, String> {
+    fn run_json_with_fallback(
+        &self,
+        options: &YdlOptions,
+        trailing_args: &[OsString],
+        log: &(impl Fn(String) + Sync),
+    ) -> Result<Value, String> {
         let mut args = options.args.clone();
-        args.extend(["--dump-single-json".into(), "--".into(), url.into()]);
-        self.run_json(args, log)
+        args.extend_from_slice(trailing_args);
+        match self.run_json(args, log) {
+            Err(message) if options.is_youtube && message.contains(PAGE_RELOAD_ERROR) => {
+                log("YouTube の既定クライアントで取得できなかったため、別のクライアントで再試行します。".to_string());
+                let mut args = options.args.clone();
+                args.extend(["--extractor-args".into(), PAGE_RELOAD_FALLBACK_EXTRACTOR_ARGS.into()]);
+                args.extend_from_slice(trailing_args);
+                self.run_json(args, log)
+            }
+            result => result,
+        }
+    }
+
+    pub fn extract_info(&self, options: &YdlOptions, url: &str, log: &(impl Fn(String) + Sync)) -> Result<Value, String> {
+        self.run_json_with_fallback(options, &["--dump-single-json".into(), "--".into(), url.into()], log)
     }
 
     pub fn resolve_download(&self, options: &YdlOptions, url: &str, log: &(impl Fn(String) + Sync)) -> Result<Value, String> {
-        let mut args = options.args.clone();
-        args.extend(["--print".into(), "%()j".into(), "--".into(), url.into()]);
-        self.run_json(args, log)
+        self.run_json_with_fallback(options, &["--print".into(), "%()j".into(), "--".into(), url.into()], log)
     }
 
     pub fn download_info(

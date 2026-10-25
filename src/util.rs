@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::bundled;
+
 pub const APP_NAME: &str = "Vidown";
 pub const APP_ID: &str = "Vidown";
 
@@ -144,6 +146,10 @@ pub fn detect_js_runtime() -> Option<(&'static str, PathBuf)> {
         ("bun", &["bun"]),
     ];
 
+    if let Some(path) = bundled::tool("deno.exe") {
+        return Some(("deno", path));
+    }
+
     CANDIDATES.iter().find_map(|(runtime_name, commands)| {
         commands
             .iter()
@@ -152,8 +158,8 @@ pub fn detect_js_runtime() -> Option<(&'static str, PathBuf)> {
     })
 }
 
-pub fn ffmpeg_available() -> bool {
-    which::which("ffmpeg").is_ok()
+pub fn find_ffmpeg() -> Option<PathBuf> {
+    bundled::tool("ffmpeg.exe").or_else(|| which::which("ffmpeg").ok())
 }
 
 pub fn find_ytdlp() -> Option<PathBuf> {
@@ -165,7 +171,7 @@ pub fn find_ytdlp() -> Option<PathBuf> {
             }
         }
     }
-    which::which("yt-dlp").ok()
+    bundled::tool("yt-dlp.exe").or_else(|| which::which("yt-dlp").ok())
 }
 
 pub fn expand_user(path: &str) -> PathBuf {
@@ -222,6 +228,16 @@ pub fn get_roaming_app_data_directory() -> PathBuf {
     std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| home_dir().unwrap_or_default().join("AppData").join("Roaming"))
+}
+
+pub fn get_local_app_data_directory() -> PathBuf {
+    #[cfg(windows)]
+    if let Some(app_data_dir) = get_windows_known_folder(&windows_sys::Win32::UI::Shell::FOLDERID_LocalAppData) {
+        return app_data_dir;
+    }
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().unwrap_or_default().join("AppData").join("Local"))
 }
 
 pub fn set_windows_app_id(app_id: &str) {

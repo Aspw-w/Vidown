@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod app;
+mod bundled;
 mod cookies;
 mod formats;
 mod parallel_http;
